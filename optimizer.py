@@ -1,21 +1,12 @@
 import os
 import numpy as np
 import math
-import pyomo.environ as pyo
-import pyomo.opt as po
+from ortools.linear_solver import pywraplp
 
 
 class optimizer:
-    def __init__(self, solverpath_exe):
-        self.solverpath_exe = solverpath_exe
-
-    def set_glpk_solver(self):
-        """
-        Sets the solver to be used to the GLPK solver.
-        Note that you have to install the GLPK solver on your machine to run the optimization model.
-        It is available here: https://www.gnu.org/software/glpk/
-        """
-        return pyo.SolverFactory("glpk", executable=self.solverpath_exe)
+    def __init__(self):
+        pass
 
     def step1_optimize_daa(self, n_cycles: int, energy_cap: int, power_cap: int, daa_price_vector: list):
         """
@@ -34,169 +25,64 @@ class optimizer:
         - step1_profit_daa: Profit from Day-ahead auction trades
         """
 
-        # Initialize pyomo model:
+        # Create the solver
+        solver = pywraplp.Solver.CreateSolver('CBC')
 
-        model = pyo.ConcreteModel()
-
-        # Set parameters:
-
-        # Number of hours
-        model.H = pyo.RangeSet(0, 23)
+        if not solver:
+            return None
 
         # Number of quarters
-        model.Q = pyo.RangeSet(1, 96)
-
-        # Number of quarters plus 1
-        model.Q_plus_1 = pyo.RangeSet(1, 97)
+        Q = 96
 
         # Daily discharged energy limit
         volume_limit = energy_cap * n_cycles
 
-        # Initialize variables:
+        # Variables
+        soc = [solver.NumVar(0, energy_cap, f'soc_{i}') for i in range(Q+1)]
+        cha_daa = [solver.NumVar(0, 1, f'cha_daa_{i}') for i in range(Q)]
+        dis_daa = [solver.NumVar(0, 1, f'dis_daa_{i}') for i in range(Q)]
 
-        # State of charge
-        model.soc = pyo.Var(model.Q_plus_1, domain=pyo.Reals)
+        # Constraints
 
-        # Charges on the Day-ahead auction
-        model.cha_daa = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC initial and final
+        solver.Add(soc[0] == 0)
+        solver.Add(soc[Q] == 0)
 
-        # Discharges on the Day-ahead auction
-        model.dis_daa = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC dynamics
+        for q in range(Q):
+            solver.Add(soc[q+1] == soc[q] + (power_cap / 4) * cha_daa[q] - (power_cap / 4) * dis_daa[q])
 
-        # Define Constraints:
+        # Cycle limits
+        solver.Add(solver.Sum([(power_cap / 4) * cha_daa[q] for q in range(Q)]) <= volume_limit)
+        solver.Add(solver.Sum([(power_cap / 4) * dis_daa[q] for q in range(Q)]) <= volume_limit)
 
-        # Remark: In some of the constraints, you will notice that the indices [q] and [q-1] are used for the same quarter. This is due to Python lists counting from 0 and Pyomo Variable lists counting from 1.
+        # Hourly parity for DA Auction (positions same in each hour's 4 quarters)
+        for h in range(24):
+            for i in range(1, 4):
+                solver.Add(cha_daa[4*h] == cha_daa[4*h + i])
+                solver.Add(dis_daa[4*h] == dis_daa[4*h + i])
 
-        def set_maximum_soc(model, q):
-            """
-            State of charge can never be higher than Energy Capacity. (Constraint 1.1)
-            """
-            return model.soc[q] <= energy_cap
+        # Objective: maximize revenue
+        objective = solver.Objective()
+        for q in range(Q):
+            objective.SetCoefficient(cha_daa[q], - (power_cap/4) * daa_price_vector[q])
+            objective.SetCoefficient(dis_daa[q], (power_cap/4) * daa_price_vector[q])
+        objective.SetMaximization()
 
-        def set_minimum_soc(model, q):
-            """
-            State of charge can never be less than 0. (Constraint 1.2)
-            """
-            return model.soc[q] >= 0
+        # Solve
+        status = solver.Solve()
 
-        def set_first_soc_to_0(model):
-            """
-            State of charge at the first quarter must be 0. (Constraint 1.3)
-            """
-            return model.soc[1] == 0
-
-        def set_last_soc_to_0(model):
-            """
-            State of charge at quarter 97 (i.e., first quarter of next day) must be 0. (Constraint 1.4)
-            """
-            return model.soc[97] == 0
-
-        def soc_step_constraint(model, q):
-            """
-            The state of charge of each quarter equals the state if charge of the previous quarter plus charges minus discharges. (Constraint 1.5)
-            """
-            return model.soc[q + 1] == model.soc[q] + power_cap / 4 * model.cha_daa[q] - power_cap / 4 * model.dis_daa[q]
-
-        def charge_cycle_limit(model):
-            """
-            Sum of all charges has to be below the daily limit. (Constraint 1.6)
-            """
-            return sum(model.cha_daa[q] * power_cap / 4 for q in model.Q) <= volume_limit
-
-        def discharge_cycle_limit(model):
-            """
-            Sum of all discharges has to be below the daily limit. (Constraint 1.7)
-            """
-            return sum(model.dis_daa[q] * power_cap / 4 for q in model.Q) <= volume_limit
-
-        def cha_daa_quarters_1_2_parity(model, q):
-            """
-            Set daa positions of quarter 1 and 2 of each hour equal. (Constraint 1.8)
-            On the DA Auction, positions in all 4 quarters of the hour have to be identical since trades are taken in hourly blocks. 
-            """
-            return model.cha_daa[4 * q + 1] == model.cha_daa[4 * q + 2]
-
-        def cha_daa_quarters_2_3_parity(model, q):
-            """
-            Set daa positions of quarter 2 and 3 of each hour equal. (Constraint 1.8)
-            """
-            return model.cha_daa[4 * q + 2] == model.cha_daa[4 * q + 3]
-
-        def cha_daa_quarters_3_4_parity(model, q):
-            """
-            Set daa positions of quarter 3 and 4 of each hour equal. (Constraint 1.8)
-            """
-            return model.cha_daa[4 * q + 3] == model.cha_daa[4 * q + 4]
-
-        def dis_daa_quarters_1_2_parity(model, q):
-            """
-            Set daa positions of quarter 1 and 2 of each hour equal. (Constraint 1.9)
-            On the DA Auction, positions in all 4 quarters of the hour have to be identical since trades are taken in hourly blocks. 
-            """
-            return model.dis_daa[4 * q + 1] == model.dis_daa[4 * q + 2]
-
-        def dis_daa_quarters_2_3_parity(model, q):
-            """
-            Set daa positions of quarter 2 and 3 of each hour equal. (Constraint 1.9)
-            """
-            return model.dis_daa[4 * q + 2] == model.dis_daa[4 * q + 3]
-
-        def dis_daa_quarters_3_4_parity(model, q):
-            """
-            Sedaa positions of quarter 3 and 4 of each hour equal. (Constraint 1.9)
-            """
-            return model.dis_daa[4 * q + 3] == model.dis_daa[4 * q + 4]
-
-        # Apply constraints on the model:
-
-        model.set_maximum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_maximum_soc)
-        model.set_minimum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_minimum_soc)
-        model.set_first_soc_to_0 = pyo.Constraint(rule=set_first_soc_to_0)
-        model.set_last_soc_to_0 = pyo.Constraint(rule=set_last_soc_to_0)
-        model.soc_step_constraint = pyo.Constraint(
-            model.Q, rule=soc_step_constraint)
-        model.charge_cycle_limit = pyo.Constraint(rule=charge_cycle_limit)
-        model.discharge_cycle_limit = pyo.Constraint(
-            rule=discharge_cycle_limit)
-        model.cha_daa_quarters_1_2_parity = pyo.Constraint(
-            model.H, rule=cha_daa_quarters_1_2_parity)
-        model.cha_daa_quarters_2_3_parity = pyo.Constraint(
-            model.H, rule=cha_daa_quarters_2_3_parity)
-        model.cha_daa_quarters_3_4_parity = pyo.Constraint(
-            model.H, rule=cha_daa_quarters_3_4_parity)
-        model.dis_daa_quarters_1_2_parity = pyo.Constraint(
-            model.H, rule=dis_daa_quarters_1_2_parity)
-        model.dis_daa_quarters_2_3_parity = pyo.Constraint(
-            model.H, rule=dis_daa_quarters_2_3_parity)
-        model.dis_daa_quarters_3_4_parity = pyo.Constraint(
-            model.H, rule=dis_daa_quarters_3_4_parity)
-
-        # Define objective function and solve the optimization problem.
-        # The objective is to maximize revenue from DA Auction trades over all possible charge-discharge schedules.
-
-        model.obj = pyo.Objective(expr=sum(power_cap/4 * daa_price_vector[q-1] * (
-            model.dis_daa[q] - model.cha_daa[q]) for q in model.Q), sense=pyo.maximize)
-
-        solver = self.set_glpk_solver()
-        solver.solve(model, timelimit=5)
-
-        # Retrieve arrays of resulting optimal soc/charge/discharge schedules after the DA Auction:
-
-        step1_soc_daa = [model.soc[q].value for q in range(
-            1, len(daa_price_vector) + 1)]
-        step1_cha_daa = [model.cha_daa[q].value for q in range(
-            1, len(daa_price_vector) + 1)]
-        step1_dis_daa = [model.dis_daa[q].value for q in range(
-            1, len(daa_price_vector) + 1)]
-
-        # Calculate profit from Day-ahead auction trades:
-
-        step1_profit_daa = sum([power_cap/4 * daa_price_vector[q] * (
-            step1_dis_daa[q] - step1_cha_daa[q]) for q in range(len(daa_price_vector))])
+        if status == pywraplp.Solver.OPTIMAL:
+            step1_soc_daa = [soc[q].solution_value() for q in range(Q)]
+            step1_cha_daa = [cha_daa[q].solution_value() for q in range(Q)]
+            step1_dis_daa = [dis_daa[q].solution_value() for q in range(Q)]
+            step1_profit_daa = sum((power_cap/4) * daa_price_vector[q] * (step1_dis_daa[q] - step1_cha_daa[q]) for q in range(Q))
+        else:
+            # Handle infeasible or other cases
+            step1_soc_daa = [0] * Q
+            step1_cha_daa = [0] * Q
+            step1_dis_daa = [0] * Q
+            step1_profit_daa = 0
 
         return(step1_soc_daa, step1_cha_daa, step1_dis_daa, step1_profit_daa)
 
@@ -223,166 +109,82 @@ class optimizer:
         - step2_dis_daaida: Combined discharges from DA Auction and ID Auction
         """
 
-        # Initialize pyomo model:
+        # Create the solver
+        solver = pywraplp.Solver.CreateSolver('CBC')
 
-        model = pyo.ConcreteModel()
-
-        # Set parameters:
-
-        # Number of hours
-        model.H = pyo.RangeSet(0, len(ida_price_vector)/4-1)
+        if not solver:
+            return None
 
         # Number of quarters
-        model.Q = pyo.RangeSet(1, len(ida_price_vector))
-
-        # Number of quarters plus 1
-        model.Q_plus_1 = pyo.RangeSet(1, len(ida_price_vector)+1)
+        Q = len(ida_price_vector)
 
         # Daily discharged energy limit
         volume_limit = energy_cap * n_cycles
 
-        # Initialize variables:
+        # Variables
+        soc = [solver.NumVar(0, energy_cap, f'soc_{i}') for i in range(Q+1)]
+        cha_ida = [solver.NumVar(0, 1, f'cha_ida_{i}') for i in range(Q)]
+        dis_ida = [solver.NumVar(0, 1, f'dis_ida_{i}') for i in range(Q)]
+        cha_ida_close = [solver.NumVar(0, 1, f'cha_ida_close_{i}') for i in range(Q)]
+        dis_ida_close = [solver.NumVar(0, 1, f'dis_ida_close_{i}') for i in range(Q)]
 
-        # State of charge
-        model.soc = pyo.Var(model.Q_plus_1, domain=pyo.Reals)
+        # Constraints
 
-        # Charges on the intraday auction
-        model.cha_ida = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC initial and final
+        solver.Add(soc[0] == 0)
+        solver.Add(soc[Q] == 0)
 
-        # Discharges on the intraday auction
-        model.dis_ida = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC dynamics
+        for q in range(Q):
+            solver.Add(soc[q+1] == soc[q] + (power_cap / 4) * (cha_ida[q] - dis_ida[q] + cha_ida_close[q] - dis_ida_close[q] + step1_cha_daa[q] - step1_dis_daa[q]))
 
-        # Charges on the intraday auction to close previous positions from the day-ahead auction
-        model.cha_ida_close = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # Cycle limits
+        charge_total = sum(step1_cha_daa) + sum(cha_ida) - sum(dis_ida_close)
+        discharge_total = sum(step1_dis_daa) + sum(dis_ida) - sum(cha_ida_close)
+        solver.Add(charge_total * (power_cap / 4) <= volume_limit)
+        solver.Add(discharge_total * (power_cap / 4) <= volume_limit)
 
-        # Charges on the intraday auction to close previous positions from the day-ahead auction
-        model.dis_ida_close = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # Close logic
+        for q in range(Q):
+            solver.Add(cha_ida_close[q] <= step1_dis_daa[q])
+            solver.Add(dis_ida_close[q] <= step1_cha_daa[q])
 
-        # Define Constraints:
+        # Rate limits
+        for q in range(Q):
+            solver.Add(cha_ida[q] + step1_cha_daa[q] <= 1)
+            solver.Add(dis_ida[q] + step1_dis_daa[q] <= 1)
 
-        def set_maximum_soc(model, q):
-            """
-            State of charge can never be higher than Energy Capacity. (Constraint 2.1)
-            """
-            return model.soc[q] <= energy_cap
+        # Objective: maximize revenue
+        objective = solver.Objective()
+        for q in range(Q):
+            coeff = (power_cap / 4) * ida_price_vector[q]
+            objective.SetCoefficient(cha_ida[q], -coeff)
+            objective.SetCoefficient(dis_ida[q], coeff)
+            objective.SetCoefficient(cha_ida_close[q], -coeff)
+            objective.SetCoefficient(dis_ida_close[q], coeff)
+        objective.SetMaximization()
 
-        def set_minimum_soc(model, q):
-            """
-            State of charge can never be less than 0. (Constraint 2.2)
-            """
-            return model.soc[q] >= 0
+        # Solve
+        status = solver.Solve()
 
-        def set_first_soc_to_0(model):
-            """
-            State of charge at the first quarter must be 0. (Constraint 2.3)
-            """
-            return model.soc[1] == 0
-
-        def set_last_soc_to_0(model):
-            """
-            State of charge at quarter 97 (i.e., first quarter of next day) must be 0. (Constraint 2.4)
-            """
-            return model.soc[97] == 0
-
-        def soc_step_constraint(model, q):
-            """
-            The state of charge of each quarter equals the state if charge of the previous quarter plus charges minus discharges. (Constraint 2.5)
-            """
-            return model.soc[q+1] == model.soc[q] + power_cap/4 * (model.cha_ida[q] - model.dis_ida[q] + model.cha_ida_close[q] - model.dis_ida_close[q] + step1_cha_daa[q-1] - step1_dis_daa[q-1])
-
-        def charge_cycle_limit(model):
-            """
-            Sum of all charges has to be below the daily limit. (Constraint 2.6)
-            """
-            return ((np.sum(step1_cha_daa) + sum(model.cha_ida[q] for q in model.Q) - sum(model.dis_ida_close[q] for q in model.Q)) * power_cap/4 <= volume_limit)
-
-        def discharge_cycle_limit(model):
-            """
-            Sum of all discharges has to be below the daily limit. (Constraint 2.7)
-            """
-            return ((np.sum(step1_dis_daa) + sum(model.dis_ida[q] for q in model.Q) - sum(model.cha_ida_close[q] for q in model.Q)) * power_cap/4 <= volume_limit)
-
-        def cha_close_logic(model, q):
-            """
-            cha_ida_close can only close or reduce existing dis_daa positions. They can only be placed, where dis_daa positions exist. (Constraint 2.8)
-            """
-            return model.cha_ida_close[q] <= step1_dis_daa[q-1]
-
-        def dis_close_logic(model, q):
-            """
-            dis_ida_close can only close or reduce existing cha_daa positions. They can only be placed, where cha_daa positions exist. (Constraint 2.9)
-            """
-            return model.dis_ida_close[q] <= step1_cha_daa[q-1]
-
-        def charge_rate_limit(model, q):
-            """
-             Sum of cha_ida[q] and cha_daa[q] has to be less or equal to 1. (Constraint 2.10)
-             """
-            return model.cha_ida[q] + step1_cha_daa[q-1] <= 1
-
-        def discharge_rate_limit(model, q):
-            """
-             Sum of dis_ida[q] and dis_daa[q] has to be less or equal to 1. (Constraint 2.11)
-             """
-            return model.dis_ida[q] + step1_dis_daa[q-1] <= 1
-
-        # Apply constraints on the model:
-
-        model.set_maximum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_maximum_soc)
-        model.set_minimum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_minimum_soc)
-        model.set_first_soc_to_0 = pyo.Constraint(rule=set_first_soc_to_0)
-        model.set_last_soc_to_0 = pyo.Constraint(rule=set_last_soc_to_0)
-        model.soc_step_constraint = pyo.Constraint(
-            model.Q, rule=soc_step_constraint)
-        model.charge_cycle_limit = pyo.Constraint(expr=charge_cycle_limit)
-        model.discharge_cycle_limit = pyo.Constraint(
-            expr=discharge_cycle_limit)
-        model.cha_close_logic = pyo.Constraint(model.Q, rule=cha_close_logic)
-        model.dis_close_logic = pyo.Constraint(model.Q, rule=dis_close_logic)
-        model.charge_rate_limit = pyo.Constraint(
-            model.Q, rule=charge_rate_limit)
-        model.discharge_rate_limit = pyo.Constraint(
-            model.Q, rule=discharge_rate_limit)
-
-        # Define objective function and solve the optimization problem
-        # The objective is to maximize revenue from ID Auction trades over all possible charge-discharge schedules.
-
-        model.obj = pyo.Objective(expr=sum(ida_price_vector[q-1] * power_cap/4 * (
-            model.dis_ida[q] + model.dis_ida_close[q] - model.cha_ida[q] - model.cha_ida_close[q]) for q in model.Q), sense=pyo.maximize)
-
-        solver = self.set_glpk_solver()
-        solver.solve(model, timelimit=5)
-
-        # Retrieve arrays of resulting optimal soc/charge/discharge schedules after the ID Auction:
-
-        step2_soc_ida = [model.soc[q].value for q in range(
-            1, len(ida_price_vector) + 1)]
-        step2_cha_ida = [model.cha_ida[q].value for q in range(
-            1, len(ida_price_vector) + 1)]
-        step2_dis_ida = [model.dis_ida[q].value for q in range(
-            1, len(ida_price_vector) + 1)]
-        step2_cha_ida_close = [model.cha_ida_close[q].value for q in range(
-            1, len(ida_price_vector) + 1)]
-        step2_dis_ida_close = [model.dis_ida_close[q].value for q in range(
-            1, len(ida_price_vector) + 1)]
-
-        # Calculate profit from Day-ahead auction trades:
-
-        step2_profit_ida = np.sum(((np.asarray(step2_dis_ida) + step2_dis_ida_close) - (
-            np.asarray(step2_cha_ida) + step2_cha_ida_close)) * ida_price_vector) * power_cap/4
-
-        # Calculate total physical charge discharge schedules of combined day-ahead and intraday auction trades:
-
-        step2_cha_daaida = np.asarray(
-            step1_cha_daa) - step2_dis_ida_close + step2_cha_ida
-        step2_dis_daaida = np.asarray(
-            step1_dis_daa) - step2_cha_ida_close + step2_dis_ida
+        if status == pywraplp.Solver.OPTIMAL:
+            step2_soc_ida = [soc[q].solution_value() for q in range(Q)]
+            step2_cha_ida = [cha_ida[q].solution_value() for q in range(Q)]
+            step2_dis_ida = [dis_ida[q].solution_value() for q in range(Q)]
+            step2_cha_ida_close = [cha_ida_close[q].solution_value() for q in range(Q)]
+            step2_dis_ida_close = [dis_ida_close[q].solution_value() for q in range(Q)]
+            step2_profit_ida = sum(ida_price_vector[q] * (power_cap/4) * (step2_dis_ida[q] + step2_dis_ida_close[q] - step2_cha_ida[q] - step2_cha_ida_close[q]) for q in range(Q))
+            step2_cha_daaida = np.array(step1_cha_daa) - np.array(step2_dis_ida_close) + np.array(step2_cha_ida)
+            step2_dis_daaida = np.array(step1_dis_daa) - np.array(step2_cha_ida_close) + np.array(step2_dis_ida)
+        else:
+            step2_soc_ida = [0] * Q
+            step2_cha_ida = [0] * Q
+            step2_dis_ida = [0] * Q
+            step2_cha_ida_close = [0] * Q
+            step2_dis_ida_close = [0] * Q
+            step2_profit_ida = 0
+            step2_cha_daaida = np.array(step1_cha_daa)
+            step2_dis_daaida = np.array(step1_dis_daa)
 
         return(step2_soc_ida, step2_cha_ida, step2_dis_ida, step2_cha_ida_close, step2_dis_ida_close, step2_profit_ida, step2_cha_daaida, step2_dis_daaida)
 
@@ -409,166 +211,81 @@ class optimizer:
         - step3_dis_daaidaidc: Combined discharges from DA Auction, ID Auction and ID Continuous
         """
 
-        # Initialize pyomo model:
+        # Create the solver
+        solver = pywraplp.Solver.CreateSolver('CBC')
 
-        model = pyo.ConcreteModel()
-
-        # Set parameters:
-
-        # Number of hours
-        model.H = pyo.RangeSet(0, len(idc_price_vector)/4-1)
+        if not solver:
+            return None
 
         # Number of quarters
-        model.Q = pyo.RangeSet(1, len(idc_price_vector))
-
-        # Number of quarters plus 1
-        model.Q_plus_1 = pyo.RangeSet(1, len(idc_price_vector)+1)
+        Q = len(idc_price_vector)
 
         # Daily discharged energy limit
         volume_limit = energy_cap * n_cycles
 
-        # Initialize variables:
+        # Variables
+        soc = [solver.NumVar(0, energy_cap, f'soc_{i}') for i in range(Q+1)]
+        cha_idc = [solver.NumVar(0, 1, f'cha_idc_{i}') for i in range(Q)]
+        dis_idc = [solver.NumVar(0, 1, f'dis_idc_{i}') for i in range(Q)]
+        cha_idc_close = [solver.NumVar(0, 1, f'cha_idc_close_{i}') for i in range(Q)]
+        dis_idc_close = [solver.NumVar(0, 1, f'dis_idc_close_{i}') for i in range(Q)]
 
-        # State of charge
-        model.soc = pyo.Var(model.Q_plus_1, domain=pyo.Reals)
+        # Constraints
 
-        # Charges on the intraday auction
-        model.cha_idc = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC initial and final
+        solver.Add(soc[0] == 0)
+        solver.Add(soc[Q] == 0)
 
-        # Discharges on the intraday auction
-        model.dis_idc = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # SOC dynamics
+        for q in range(Q):
+            solver.Add(soc[q+1] == soc[q] + (power_cap / 4) * (cha_idc[q] - dis_idc[q] + cha_idc_close[q] - dis_idc_close[q] + step2_cha_daaida[q] - step2_dis_daaida[q]))
 
-        # Charges on the intraday auction to close previous positions from the day-ahead auction
-        model.cha_idc_close = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # Cycle limits
+        charge_total = sum(step2_dis_daaida) + sum(dis_idc) - sum(cha_idc_close)
+        discharge_total = sum(step2_cha_daaida) + sum(cha_idc) - sum(dis_idc_close)
+        solver.Add(charge_total * (power_cap / 4) <= volume_limit)
+        solver.Add(discharge_total * (power_cap / 4) <= volume_limit)
 
-        # Charges on the intraday auction to close previous positions from the day-ahead auction
-        model.dis_idc_close = pyo.Var(
-            model.Q, domain=pyo.NonNegativeReals, bounds=(0, 1))
+        # Close logic
+        for q in range(Q):
+            solver.Add(cha_idc_close[q] <= step2_dis_daaida[q])
+            solver.Add(dis_idc_close[q] <= step2_cha_daaida[q])
 
-        # Set Constraints:
+        # Rate limits
+        for q in range(Q):
+            solver.Add(cha_idc[q] + step2_cha_daaida[q] <= 1)
+            solver.Add(dis_idc[q] + step2_dis_daaida[q] <= 1)
 
-        def set_maximum_soc(model, q):
-            """
-            State of charge can never be higher than Energy Capacity. (Constraint 3.1)
-            """
-            return model.soc[q] <= energy_cap
+        # Objective: maximize revenue
+        objective = solver.Objective()
+        for q in range(Q):
+            coeff = (power_cap / 4) * idc_price_vector[q]
+            objective.SetCoefficient(cha_idc[q], -coeff)
+            objective.SetCoefficient(dis_idc[q], coeff)
+            objective.SetCoefficient(cha_idc_close[q], -coeff)
+            objective.SetCoefficient(dis_idc_close[q], coeff)
+        objective.SetMaximization()
 
-        def set_minimum_soc(model, q):
-            """
-            State of charge can never be less than 0. (Constraint 3.2)
-            """
-            return model.soc[q] >= 0
+        # Solve
+        status = solver.Solve()
 
-        def set_first_soc_to_0(model):
-            """
-            State of charge at the first quarter must be 0. (Constraint 3.3)
-            """
-            return model.soc[1] == 0
-
-        def set_last_soc_to_0(model):
-            """
-            State of charge at quarter 97 (i.e., first quarter of next day) must be 0. (Constraint 3.4)
-            """
-            return model.soc[97] == 0
-
-        def soc_step_constraint(model, q):
-            """
-            The state of charge of each quarter equals the state if charge of the previous quarter plus charges minus discharges. (Constraint 3.5)
-            """
-            return model.soc[q+1] == model.soc[q] + power_cap/4 * (model.cha_idc[q] - model.dis_idc[q] + model.cha_idc_close[q] - model.dis_idc_close[q] + step2_cha_daaida[q-1] - step2_dis_daaida[q-1])
-
-        def charge_cycle_limit(model):
-            """
-            Sum of all charges has to be below the daily limit. (Constraint 3.6)
-            """
-            return (np.sum(step2_dis_daaida) + sum(model.dis_idc[q] for q in model.Q) - sum(model.cha_idc_close[q] for q in model.Q)) * power_cap/4 <= volume_limit
-
-        def discharge_cycle_limit(model):
-            """
-            Sum of all discharges has to be below the daily limit. (Constraint 3.7)
-            """
-            return (np.sum(step2_cha_daaida) + sum(model.cha_idc[q] for q in model.Q) - sum(model.dis_idc_close[q] for q in model.Q)) * power_cap/4 <= volume_limit
-
-        def cha_close_logic(model, q):
-            """
-            cha_idc_close can only close or reduce existing dis_daaida positions. They can only be placed, where dis_daaida positions exist. (Constraint 3.8)
-            """
-            return model.cha_idc_close[q] <= step2_dis_daaida[q-1]
-
-        def dis_close_logic(model, q):
-            """
-            dis_idc_close can only close or reduce existing cha_daaida positions. They can only be placed, where cha_daaida positions exist. (Constraint 3.9)
-            """
-            return model.dis_idc_close[q] <= step2_cha_daaida[q-1]
-
-        def charge_rate_limit(model, q):
-            """
-             Sum of cha_idc[q] and cha_daaida[q] has to be less or equal to 1. (Constraint 3.10)
-             """
-            return model.cha_idc[q] + step2_cha_daaida[q-1] <= 1
-
-        def discharge_rate_limit(model, q):
-            """
-             Sum of dis_idc[q] and dis_daaida[q] has to be less or equal to 1. (Constraint 3.11)
-             """
-            return model.dis_idc[q] + step2_dis_daaida[q-1] <= 1
-
-        # Apply constraints on the model:
-
-        model.set_maximum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_maximum_soc)
-        model.set_minimum_soc = pyo.Constraint(
-            model.Q_plus_1, rule=set_minimum_soc)
-        model.set_first_soc_to_0 = pyo.Constraint(rule=set_first_soc_to_0)
-        model.set_last_soc_to_0 = pyo.Constraint(rule=set_last_soc_to_0)
-        model.soc_step_constraint = pyo.Constraint(
-            model.Q, rule=soc_step_constraint)
-        model.charge_cycle_limit = pyo.Constraint(rule=charge_cycle_limit)
-        model.discharge_cycle_limit = pyo.Constraint(
-            rule=discharge_cycle_limit)
-
-        model.cha_close_logic = pyo.Constraint(model.Q, rule=cha_close_logic)
-        model.dis_close_logic = pyo.Constraint(model.Q, rule=dis_close_logic)
-        model.charge_rate_limit = pyo.Constraint(
-            model.Q, rule=charge_rate_limit)
-        model.discharge_rate_limit = pyo.Constraint(
-            model.Q, rule=discharge_rate_limit)
-
-        # Define objective function and solve the optimization problem
-        # The objective is to maximize revenue from ID Continuous trades over all possible charge-discharge schedules.
-
-        model.obj = pyo.Objective(expr=sum([idc_price_vector[q-1] * power_cap/4 * (
-            model.dis_idc[q]+model.dis_idc_close[q]-model.cha_idc[q]-model.cha_idc_close[q]) for q in model.Q]), sense=pyo.maximize)
-
-        solver = self.set_glpk_solver()
-        solver.solve(model, timelimit=5)
-
-        # Retrieve arrays of resulting optimal soc/charge/discharge schedules after the ID Auction:
-
-        step3_soc_idc = [model.soc[q].value for q in range(
-            1, len(idc_price_vector) + 1)]
-        step3_cha_idc = [model.cha_idc[q].value for q in range(
-            1, len(idc_price_vector) + 1)]
-        step3_dis_idc = [model.dis_idc[q].value for q in range(
-            1, len(idc_price_vector) + 1)]
-        step3_cha_idc_close = [model.cha_idc_close[q].value for q in range(
-            1, len(idc_price_vector) + 1)]
-        step3_dis_idc_close = [model.dis_idc_close[q].value for q in range(
-            1, len(idc_price_vector) + 1)]
-
-        # Calculate profit from Day-ahead auction trades:
-
-        step3_profit_idc = np.sum(((np.asarray(step3_dis_idc) + step3_dis_idc_close) - (
-            np.asarray(step3_cha_idc) + step3_cha_idc_close)) * idc_price_vector) * power_cap/4
-
-        # Calculate total physical charge discharge schedules of combined day-ahead and intraday auction trades:
-
-        step3_cha_daaidaidc = np.asarray(
-            step2_cha_daaida) - step3_dis_idc_close + step3_cha_idc
-        step3_dis_daaidaidc = np.asarray(
-            step2_dis_daaida) - step3_cha_idc_close + step3_dis_idc
+        if status == pywraplp.Solver.OPTIMAL:
+            step3_soc_idc = [soc[q].solution_value() for q in range(Q)]
+            step3_cha_idc = [cha_idc[q].solution_value() for q in range(Q)]
+            step3_dis_idc = [dis_idc[q].solution_value() for q in range(Q)]
+            step3_cha_idc_close = [cha_idc_close[q].solution_value() for q in range(Q)]
+            step3_dis_idc_close = [dis_idc_close[q].solution_value() for q in range(Q)]
+            step3_profit_idc = sum(idc_price_vector[q] * (power_cap/4) * (step3_dis_idc[q] + step3_dis_idc_close[q] - step3_cha_idc[q] - step3_cha_idc_close[q]) for q in range(Q))
+            step3_cha_daaidaidc = np.array(step2_cha_daaida) - np.array(step3_dis_idc_close) + np.array(step3_cha_idc)
+            step3_dis_daaidaidc = np.array(step2_dis_daaida) - np.array(step3_cha_idc_close) + np.array(step3_dis_idc)
+        else:
+            step3_soc_idc = [0] * Q
+            step3_cha_idc = [0] * Q
+            step3_dis_idc = [0] * Q
+            step3_cha_idc_close = [0] * Q
+            step3_dis_idc_close = [0] * Q
+            step3_profit_idc = 0
+            step3_cha_daaidaidc = np.array(step2_cha_daaida)
+            step3_dis_daaidaidc = np.array(step2_dis_daaida)
 
         return(step3_soc_idc, step3_cha_idc, step3_dis_idc, step3_cha_idc_close, step3_dis_idc_close, step3_profit_idc, step3_cha_daaidaidc, step3_dis_daaidaidc)
